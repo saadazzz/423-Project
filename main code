@@ -1,0 +1,1561 @@
+from OpenGL.GL import *
+from OpenGL.GLUT import *
+from OpenGL.GLU import *
+import time
+import math
+import random
+
+# ============================================================
+# PHASE 0 — SCAFFOLDING
+# All state variables the game will need across every phase.
+# Nothing is drawn yet — this just sets up the skeleton so we
+# can build world geometry, player, and systems on top of it.
+# ============================================================
+
+# ---------- Window / Camera (from template) ----------
+camera_pos = (0, 500, 500)      # will be recalculated once player + TP camera exist
+fovY = 120                       # default FOV; binoculars feature will override temporarily
+fovY_default = 120
+fovY_zoomed = 40
+is_zoomed = False
+
+GRID_LENGTH = 600                # reused for island/water plane sizing later
+
+# ---------- Game State Machine ----------
+# One of: "PLAYING", "PAUSED", "GAME_OVER", "VICTORY"
+game_state = "PLAYING"
+
+# ---------- Timing (no glutTimerFunc allowed — we compute delta time manually) ----------
+last_frame_time = None           # set on first idle() call
+elapsed_time = 0.0                # total seconds since game start (excludes paused time)
+
+# ---------- Player ----------
+player_pos = [-340.0, 0.0, 0.0]     # spawn just off the dock (DOCK_POS = (-380,0,0)), on the island
+player_angle = 90.0                # facing direction in degrees (90 = facing +y, into the island)
+player_speed = 6.0
+
+# ---------- Camera Mode ----------
+camera_mode = "THIRD_PERSON"      # "THIRD_PERSON" or could extend later
+camera_follow_distance = 300
+camera_follow_height = 200
+
+# ---------- Lives / Game Over tracking ----------
+player_lives = 3
+
+# ---------- Countdown Timer ----------
+TIME_LIMIT = 120.0                # seconds before storm becomes critical
+time_remaining = TIME_LIMIT
+
+# ---------- Resource / Progression state ----------
+fuel_collected = 0
+fuel_required = 3
+generator_on = False
+bridge_open = False        # becomes True once generator_on (triggers rise animation)
+gate_open = False          # becomes True once player reaches gate with bridge risen
+bridge_anim = 0.0          # 0.0 = submerged/closed, 1.0 = fully risen/open
+gate_anim = 0.0            # 0.0 = closed/blocking, 1.0 = fully open
+BARRIER_ANIM_SPEED = 0.5   # progress per second
+
+INTERACT_RANGE = 60.0
+GATE_TRIGGER_RANGE = 90.0
+BEACON_INTERACT_RANGE = 70.0
+
+beacon_rotation = 0.0
+BEACON_ROTATION_SPEED = 60.0   # degrees per second, only spins after victory
+
+interaction_message = ""
+interaction_message_timer = 0.0
+
+# ---------- Environmental hazard ----------
+water_level = 0.0
+water_rise_rate = 0.5             # units per second
+
+# Low-elevation coastal strips on each island that flood at different
+# times as water_level rises — this is what forces rerouting, since a
+# safe path early on can become hazardous later without the player
+# doing anything differently.
+FLOOD_ZONES = [
+    # (x0, x1, y0, y1, threshold) — zone becomes hazardous once water_level exceeds threshold
+    (-400, -60, -250, -195, 12),   # Island A south coastal strip — floods early
+    (60, 400, -250, -195, 12),     # Island B south coastal strip — floods early
+    (-400, -60, 195, 250, 28),     # Island A north strip — floods later
+    (60, 400, 195, 250, 28),       # Island B north strip — floods later
+]
+
+# Exposure/stamina meter: drains continuously while standing in an
+# active flood zone, regenerates on dry ground. A life is only lost
+# once it's fully depleted — duration-based, not a single-touch hit,
+# which is the structural difference from Assignment 3's hit system.
+player_exposure = 100.0
+EXPOSURE_DRAIN_RATE = 22.0        # per second, while in flooded zone
+EXPOSURE_REGEN_RATE = 12.0        # per second, while on dry ground
+
+# ---------- Score ----------
+score = 0
+
+# Score multiplier / combo: collecting fuel canisters within COMBO_WINDOW
+# seconds of each other stacks the multiplier (up to MAX_MULTIPLIER);
+# too much time between pickups resets it back to 1.
+score_multiplier = 1
+last_fuel_pickup_time = None
+COMBO_WINDOW = 5.0
+MAX_MULTIPLIER = 5
+
+# Lightning flash: fires at random intervals that shrink as the storm
+# timer runs down (more frequent flashes = more urgency), using the
+# same elapsed_time-based scheduling as everything else — no glutTimerFunc.
+next_lightning_time = 3.0
+lightning_flash_timer = 0.0
+LIGHTNING_FLASH_DURATION = 0.15
+
+# ---------- Rain storm effect ----------
+# Simple 3D rain made from GL_LINES. Rain becomes heavier and faster
+# as the countdown gets lower. No textures, shaders, or timers.
+MAX_RAIN_DROPS = 300
+RAIN_MIN_SPEED = 180.0
+RAIN_MAX_SPEED = 350.0
+RAIN_TOP_HEIGHT = 420.0
+RAIN_BOTTOM_HEIGHT = 0.0
+rain_drops = []
+
+def initialize_rain():
+    """Create rain drops around the player."""
+    global rain_drops
+    rain_drops = []
+
+    for _ in range(MAX_RAIN_DROPS):
+        rain_drops.append([
+            random.uniform(-450.0, 450.0),
+            random.uniform(-350.0, 350.0),
+            random.uniform(RAIN_BOTTOM_HEIGHT, RAIN_TOP_HEIGHT)
+        ])
+
+def update_rain(dt):
+    """Move rain downward; speed increases as the storm approaches."""
+    storm_progress = 1.0 - (time_remaining / TIME_LIMIT)
+    storm_progress = max(0.0, min(1.0, storm_progress))
+
+    rain_speed = (
+        RAIN_MIN_SPEED
+        + (RAIN_MAX_SPEED - RAIN_MIN_SPEED) * storm_progress
+    )
+
+    for drop in rain_drops:
+        drop[2] -= rain_speed * dt
+
+        if drop[2] <= RAIN_BOTTOM_HEIGHT:
+            drop[0] = random.uniform(-450.0, 450.0)
+            drop[1] = random.uniform(-350.0, 350.0)
+            drop[2] = RAIN_TOP_HEIGHT
+
+def draw_rain():
+    """Draw increasingly heavy rain around the player."""
+    if TIME_LIMIT <= 0 or not rain_drops:
+        return
+
+    storm_progress = 1.0 - (time_remaining / TIME_LIMIT)
+    storm_progress = max(0.0, min(1.0, storm_progress))
+
+    minimum_visible = 80
+    visible_drops = int(
+        minimum_visible
+        + (MAX_RAIN_DROPS - minimum_visible) * storm_progress
+    )
+
+    glColor3f(0.65, 0.75, 0.9)
+    glBegin(GL_LINES)
+
+    for i in range(visible_drops):
+        x_offset, y_offset, z = rain_drops[i]
+        x = player_pos[0] + x_offset
+        y = player_pos[1] + y_offset
+
+        glVertex3f(x, y, z)
+        glVertex3f(x, y, z - 18.0)
+
+    glEnd()
+
+# Cheat / debug modes — for testing and demonstration only.
+cheat_infinite_fuel = False
+cheat_tide_freeze = False
+
+# ============================================================
+# PHASE 1 — STATIC WORLD LAYOUT
+# Fixed coordinates for every static structure. Up-axis is Z,
+# matching the template's gluLookAt(..., 0,0,1) up-vector.
+# Two landmasses with a gap between them (bridge site):
+#   Island A (x: -400..-60)  -> dock, generator, spawn
+#   Island B (x:  60..400)   -> lighthouse, gate
+#   Gap      (x: -60..60)    -> water channel, bridge goes here
+# ============================================================
+ISLAND_A_BOUNDS = (-400, -60, -250, 250)   # x_min, x_max, y_min, y_max
+ISLAND_B_BOUNDS = (60, 400, -250, 250)
+
+DOCK_POS = (-380, 0, 0)                     # spawn point, edge of Island A
+GENERATOR_POS = (-200, 150, 0)
+LIGHTHOUSE_POS = (350, 0, 0)
+GATE_POS = (230, 0, 0)
+BRIDGE_CENTER = (0, 0, 0)                   # fills the gap when open
+
+ROCK_POSITIONS = [                          # (x, y, scale)
+    (-300, 180, 18),
+    (-150, -190, 24),
+    (180, 190, 20),
+    (300, -160, 22),
+    (-320, -100, 16),
+]
+
+PLANT_POSITIONS = [                         # (x, y, base_radius, height) — decorative cones
+    (-370, 200, 20, 70),
+    (-250, 220, 15, 50),
+    (-380, -180, 22, 80),
+    (-100, 200, 14, 45),
+    (350, 200, 18, 60),
+    (380, -200, 20, 65),
+    (200, -220, 14, 40),
+    (100, 180, 16, 50),
+]
+
+FUEL_SPAWN_POSITIONS = [                    # (x, y) — all on Island A, reachable before the bridge
+    (-380, -150),
+    (-100, -180),
+    (-300, 50),
+    (-90, 180),
+]
+FUEL_PICKUP_RADIUS = 30.0
+
+# Runtime canister state — rebuilt fresh in reset_game_state()
+fuel_canisters = [{"pos": p, "collected": False} for p in FUEL_SPAWN_POSITIONS]
+
+# Drifting debris — patrol motion via sin(elapsed_time), NOT chasing the
+# player. Placed on the south coastal strips (the ones that flood early)
+# so they periodically block the safe crossing point, forcing timing
+# decisions rather than pure route-planning.
+DEBRIS = [
+    {"base_x": -230, "base_y": -215, "axis": "y", "amplitude": 25, "speed": 0.6, "radius": 18},
+    {"base_x": 230, "base_y": -215, "axis": "y", "amplitude": 25, "speed": 0.5, "radius": 18},
+]
+
+# ============================================================
+# GOAT AI
+# WAIT -> CHASE -> RETURN TO PATROL
+# ============================================================
+
+# Goat patrol route on Island B
+goat_patrol_points = [
+    (130.0, 170.0),
+    (330.0, 170.0),
+    (330.0, -120.0),
+    (130.0, -120.0)
+]
+
+# Goat starts at the first patrol point
+goat_pos = [130.0, 170.0]
+
+# Which patrol point the goat will return to
+goat_patrol_index = 1
+
+# Goat AI states:
+# WAIT    = stays still until player reaches Island B
+# CHASE   = follows the player around Island B
+# RETURN  = returns to its patrol position
+goat_state = "WAIT"
+
+# Movement speeds
+goat_speed = 4.0
+goat_chase_speed = 20.0
+
+# Distance at which goat catches the player
+goat_attack_radius = 30.0
+
+# Prevents repeated attacks every frame
+goat_attack_cooldown = 0.0
+
+
+def reset_game_state():
+    """
+    Resets every piece of game state back to initial values.
+    Called on startup and whenever R (restart) is pressed.
+    """
+    global game_state, last_frame_time, elapsed_time
+    global player_pos, player_angle
+    global player_lives, time_remaining
+    global fuel_collected, generator_on, bridge_open, gate_open
+    global bridge_anim, gate_anim, fuel_canisters
+    global interaction_message, interaction_message_timer
+    global player_exposure
+    global beacon_rotation
+    global score_multiplier, last_fuel_pickup_time
+    global next_lightning_time, lightning_flash_timer
+    global water_level, score, is_zoomed, fovY
+    global goat_pos, goat_patrol_index, goat_state, goat_attack_cooldown
+
+    game_state = "PLAYING"
+    last_frame_time = None
+    elapsed_time = 0.0
+
+    player_pos = [-340.0, 0.0, 0.0]
+    player_angle = 90.0
+
+    player_lives = 3
+    time_remaining = TIME_LIMIT
+
+    fuel_collected = 0
+    generator_on = False
+    bridge_open = False
+    gate_open = False
+    bridge_anim = 0.0
+    gate_anim = 0.0
+    fuel_canisters = [{"pos": p, "collected": False} for p in FUEL_SPAWN_POSITIONS]
+    interaction_message = ""
+    interaction_message_timer = 0.0
+
+    water_level = 0.0
+    player_exposure = 100.0
+    beacon_rotation = 0.0
+    score = 0
+    score_multiplier = 1
+    last_fuel_pickup_time = None
+    next_lightning_time = 3.0
+    lightning_flash_timer = 0.0
+    # Note: cheat_infinite_fuel / cheat_tide_freeze are intentionally NOT
+    # reset here — they're testing/demo toggles the grader may want to
+    # keep on across multiple restarts.
+
+    is_zoomed = False
+    fovY = fovY_default
+
+    goat_pos = [130.0, 170.0]
+    goat_patrol_index = 1
+    goat_state = "WAIT"
+    goat_attack_cooldown = 0.0
+
+    initialize_rain()
+
+
+def move_toward(current_x, current_y, target_x, target_y, speed, dt):
+    """
+    Moves an object toward a target at a fixed speed.
+
+    Returns the object's new x and y coordinates.
+    """
+
+    dx = target_x - current_x
+    dy = target_y - current_y
+
+    distance = math.sqrt(dx * dx + dy * dy)
+
+    if distance < 0.001:
+        return target_x, target_y
+
+    step = speed * dt
+
+    if step >= distance:
+        return target_x, target_y
+
+    new_x = current_x + (dx / distance) * step
+    new_y = current_y + (dy / distance) * step
+
+    return new_x, new_y
+
+def handle_goat_hit():
+    """
+    Called when the goat catches the player.
+
+    The player loses one life and respawns at the dock.
+    """
+
+    global player_lives
+    global player_exposure
+    global game_state
+
+    player_lives -= 1
+    player_exposure = 100.0
+
+    respawn_at_dock()
+
+    if player_lives <= 0:
+
+        game_state = "GAME_OVER"
+
+        set_interaction_message(
+            "GAME OVER — the wild goat caught you!",
+            duration=999
+        )
+
+    else:
+
+        set_interaction_message(
+            f"The wild goat caught you! Lives remaining: {player_lives}"
+        )
+
+def update_goat(dt):
+    """
+    Updates the goat's AI.
+
+    WAIT:
+        Goat stays at its starting position until the player
+        reaches Island B.
+
+    CHASE:
+        Once the player reaches Island B, the goat chases them.
+
+    RETURN:
+        If the player goes back to Island A, the goat returns
+        to its patrol route.
+
+    ATTACK:
+        If the goat gets close enough to the player, the player
+        loses a life and respawns at the dock.
+    """
+
+    global goat_pos
+    global goat_patrol_index
+    global goat_state
+    global goat_attack_cooldown
+
+    # --------------------------------------------------------
+    # Attack cooldown
+    # --------------------------------------------------------
+    if goat_attack_cooldown > 0.0:
+        goat_attack_cooldown -= dt
+
+    # --------------------------------------------------------
+    # Check whether player has reached Island B
+    #
+    # Island B:
+    # x = 60 to 400
+    # y = -250 to 250
+    #
+    # We use a slightly smaller safe area so the goat activates
+    # once the player is clearly on the other island.
+    # --------------------------------------------------------
+    player_on_island_b = (
+        player_pos[0] >= 80.0
+        and -230.0 <= player_pos[1] <= 230.0
+    )
+
+    # --------------------------------------------------------
+    # STATE 1: WAIT
+    # --------------------------------------------------------
+    if goat_state == "WAIT":
+
+        # Goat remains completely stationary here.
+
+        if player_on_island_b:
+
+            goat_state = "CHASE"
+
+            set_interaction_message(
+                "WARNING! The wild goat spotted you!"
+            )
+
+    # --------------------------------------------------------
+    # STATE 2: CHASE
+    # --------------------------------------------------------
+    elif goat_state == "CHASE":
+
+        # If player leaves Island B, stop chasing.
+        if not player_on_island_b:
+
+            goat_state = "RETURN"
+
+            set_interaction_message(
+                "You escaped the goat. It is returning to patrol."
+            )
+
+        else:
+
+            # Chase the player.
+            goat_pos[0], goat_pos[1] = move_toward(
+                goat_pos[0],
+                goat_pos[1],
+                player_pos[0],
+                player_pos[1],
+                goat_chase_speed,
+                dt
+            )
+
+    # --------------------------------------------------------
+    # STATE 3: RETURN
+    # --------------------------------------------------------
+    elif goat_state == "RETURN":
+
+        # If the player enters Island B again before the goat
+        # reaches its patrol point, start chasing again.
+        if player_on_island_b:
+
+            goat_state = "CHASE"
+
+            set_interaction_message(
+                "The wild goat is chasing you again!"
+            )
+
+        else:
+
+            # Return to patrol point.
+            target_x, target_y = goat_patrol_points[goat_patrol_index]
+
+            goat_pos[0], goat_pos[1] = move_toward(
+                goat_pos[0],
+                goat_pos[1],
+                target_x,
+                target_y,
+                goat_speed,
+                dt
+            )
+
+            # Reached patrol point.
+            if _distance(
+                goat_pos[0],
+                goat_pos[1],
+                target_x,
+                target_y
+            ) < 2.0:
+
+                goat_state = "WAIT"
+
+    # --------------------------------------------------------
+    # Check if goat caught the player
+    # --------------------------------------------------------
+
+    distance_to_player = _distance(
+        goat_pos[0],
+        goat_pos[1],
+        player_pos[0],
+        player_pos[1]
+    )
+
+    if distance_to_player <= goat_attack_radius:
+
+        if goat_attack_cooldown <= 0.0:
+
+            goat_attack_cooldown = 2.0
+
+            handle_goat_hit()
+
+
+def draw_goat():
+    """
+    Draws the wild goat using simple OpenGL primitives.
+
+    Body:
+        Cube
+
+    Head:
+        Sphere
+
+    Horns:
+        Cylinders
+
+    Legs:
+        Four small cubes
+
+    Tail:
+        Small sphere
+    """
+
+    x, y = goat_pos[0], goat_pos[1]
+
+    glPushMatrix()
+
+    glTranslatef(x, y, 0)
+
+    # --------------------------------------------------------
+    # Body
+    # --------------------------------------------------------
+    glColor3f(0.35, 0.25, 0.15)
+
+    glPushMatrix()
+    glTranslatef(0, 0, 28)
+    glScalef(45, 20, 25)
+    glutSolidCube(1)
+    glPopMatrix()
+
+    # --------------------------------------------------------
+    # Head
+    # --------------------------------------------------------
+    glColor3f(0.45, 0.32, 0.20)
+
+    glPushMatrix()
+    glTranslatef(28, 0, 45)
+    gluSphere(gluNewQuadric(), 15, 10, 10)
+    glPopMatrix()
+
+    # --------------------------------------------------------
+    # Horn 1
+    # --------------------------------------------------------
+    glColor3f(0.85, 0.75, 0.55)
+
+    glPushMatrix()
+    glTranslatef(35, 10, 55)
+    glRotatef(-35, 0, 1, 0)
+    gluCylinder(
+        gluNewQuadric(),
+        4,
+        1,
+        18,
+        8,
+        8
+    )
+    glPopMatrix()
+
+    # --------------------------------------------------------
+    # Horn 2
+    # --------------------------------------------------------
+    glPushMatrix()
+    glTranslatef(35, -10, 55)
+    glRotatef(-35, 0, 1, 0)
+    gluCylinder(
+        gluNewQuadric(),
+        4,
+        1,
+        18,
+        8,
+        8
+    )
+    glPopMatrix()
+
+    # --------------------------------------------------------
+    # Legs
+    # --------------------------------------------------------
+    glColor3f(0.25, 0.18, 0.12)
+
+    leg_positions = [
+        (-15, -8),
+        (-15, 8),
+        (15, -8),
+        (15, 8)
+    ]
+
+    for lx, ly in leg_positions:
+
+        glPushMatrix()
+
+        glTranslatef(lx, ly, 10)
+
+        glScalef(7, 7, 20)
+
+        glutSolidCube(1)
+
+        glPopMatrix()
+
+    # --------------------------------------------------------
+    # Tail
+    # --------------------------------------------------------
+    glColor3f(0.4, 0.3, 0.2)
+
+    glPushMatrix()
+    glTranslatef(-25, 0, 40)
+    gluSphere(gluNewQuadric(), 7, 8, 8)
+    glPopMatrix()
+
+    glPopMatrix()
+
+             
+def draw_text(x, y, text, font=GLUT_BITMAP_HELVETICA_18):
+    """Unchanged from template — screen-space text via orthographic overlay."""
+    glColor3f(1, 1, 1)
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    gluOrtho2D(0, 1000, 0, 800)
+
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+
+    glRasterPos2f(x, y)
+    for ch in text:
+        glutBitmapCharacter(font, ord(ch))
+
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+
+
+# ============================================================
+# PHASE 1 — STATIC WORLD DRAWING
+# Built only from glTranslatef/glRotatef/glScalef, glPushMatrix/
+# glPopMatrix, GL_QUADS, glutSolidCube, gluCylinder, gluSphere,
+# gluNewQuadric — same primitives as the template's draw_shapes().
+# None of this counts as a scored feature (static geometry), but
+# it's required groundwork for everything else.
+# ============================================================
+
+def draw_island_terrain():
+    """Two separate landmasses with a gap between them (the future bridge site)."""
+    ax0, ax1, ay0, ay1 = ISLAND_A_BOUNDS
+    bx0, bx1, by0, by1 = ISLAND_B_BOUNDS
+
+    glPushMatrix()
+    glColor3f(0.55, 0.45, 0.25)  # sandy brown — Island A
+    glBegin(GL_QUADS)
+    glVertex3f(ax0, ay0, 0)
+    glVertex3f(ax1, ay0, 0)
+    glVertex3f(ax1, ay1, 0)
+    glVertex3f(ax0, ay1, 0)
+    glEnd()
+
+    glColor3f(0.45, 0.5, 0.3)  # slightly greener — Island B
+    glBegin(GL_QUADS)
+    glVertex3f(bx0, by0, 0)
+    glVertex3f(bx1, by0, 0)
+    glVertex3f(bx1, by1, 0)
+    glVertex3f(bx0, by1, 0)
+    glEnd()
+    glPopMatrix()
+
+
+def draw_water():
+    """
+    Large water plane surrounding both islands. Height reads from
+    `water_level`, incremented every frame in idle().
+    """
+    glPushMatrix()
+    glColor3f(0.1, 0.35, 0.65)
+    z = -10 + water_level
+    glBegin(GL_QUADS)
+    glVertex3f(-600, -600, z)
+    glVertex3f(600, -600, z)
+    glVertex3f(600, 600, z)
+    glVertex3f(-600, 600, z)
+    glEnd()
+    glPopMatrix()
+
+
+def draw_flood_zones():
+    """
+    Visual overlay for each coastal strip that's currently underwater
+    (water_level has passed that zone's threshold). Drawn as a
+    slightly-raised blue quad directly over the affected ground so
+    the hazard is visible before the player steps into it.
+    """
+    for x0, x1, y0, y1, threshold in FLOOD_ZONES:
+        if water_level <= threshold:
+            continue
+        glPushMatrix()
+        glColor3f(0.15, 0.45, 0.75)
+        glBegin(GL_QUADS)
+        glVertex3f(x0, y0, 1.5)
+        glVertex3f(x1, y0, 1.5)
+        glVertex3f(x1, y1, 1.5)
+        glVertex3f(x0, y1, 1.5)
+        glEnd()
+        glPopMatrix()
+
+
+def draw_boundary_walls():
+    """
+    Colored vertical boundary quads at the outer play area edge —
+    same technique as the template's colored grid-boundary quads,
+    just repositioned to frame the whole island+water area.
+    """
+    height = 150
+    glPushMatrix()
+    glBegin(GL_QUADS)
+
+    glColor3f(0.1, 0.6, 0.9)   # north wall
+    glVertex3f(-600, 600, 0); glVertex3f(600, 600, 0)
+    glVertex3f(600, 600, height); glVertex3f(-600, 600, height)
+
+    glColor3f(0.2, 0.7, 0.4)   # south wall
+    glVertex3f(-600, -600, 0); glVertex3f(600, -600, 0)
+    glVertex3f(600, -600, height); glVertex3f(-600, -600, height)
+
+    glColor3f(0.6, 0.2, 0.7)   # east wall
+    glVertex3f(600, -600, 0); glVertex3f(600, 600, 0)
+    glVertex3f(600, 600, height); glVertex3f(600, -600, height)
+
+    glColor3f(0.7, 0.6, 0.2)   # west wall
+    glVertex3f(-600, -600, 0); glVertex3f(-600, 600, 0)
+    glVertex3f(-600, 600, height); glVertex3f(-600, -600, height)
+
+    glEnd()
+    glPopMatrix()
+
+
+def draw_dock():
+    """Small platform with two posts marking the player's spawn point."""
+    x, y, z = DOCK_POS
+    glPushMatrix()
+    glTranslatef(x, y, z)
+
+    glColor3f(0.4, 0.3, 0.2)
+    glPushMatrix()
+    glScalef(60, 40, 6)
+    glutSolidCube(1)
+    glPopMatrix()
+
+    glColor3f(0.3, 0.2, 0.15)
+    for ox, oy in [(-25, -15), (25, 15)]:
+        glPushMatrix()
+        glTranslatef(ox, oy, 0)
+        gluCylinder(gluNewQuadric(), 4, 4, 30, 8, 8)
+        glPopMatrix()
+
+    glPopMatrix()
+
+
+def draw_generator():
+    """Generator housing + chimney + red/green status light."""
+    x, y, z = GENERATOR_POS
+    glPushMatrix()
+    glTranslatef(x, y, z)
+
+    glColor3f(0.5, 0.5, 0.55)
+    glPushMatrix()
+    glScalef(50, 50, 40)
+    glTranslatef(0, 0, 0.5)
+    glutSolidCube(1)
+    glPopMatrix()
+
+    glColor3f(0.3, 0.3, 0.3)
+    glPushMatrix()
+    glTranslatef(0, 0, 40)
+    gluCylinder(gluNewQuadric(), 8, 8, 25, 8, 8)
+    glPopMatrix()
+
+    # Status light: RED when OFF, GREEN when ON.
+    if generator_on:
+        glColor3f(0.1, 1.0, 0.1)
+    else:
+        glColor3f(1.0, 0.1, 0.1)
+
+    glPushMatrix()
+    glTranslatef(0, -27, 35)
+    gluSphere(gluNewQuadric(), 9, 12, 12)
+    glPopMatrix()
+
+    glPopMatrix()
+
+
+def draw_rocks():
+    """Scattered obstacles built from scaled spheres."""
+    glColor3f(0.4, 0.4, 0.4)
+    for x, y, scale in ROCK_POSITIONS:
+        glPushMatrix()
+        glTranslatef(x, y, scale * 0.5)
+        glScalef(scale / 20.0, scale / 20.0, scale / 20.0)
+        gluSphere(gluNewQuadric(), 20, 10, 10)
+        glPopMatrix()
+
+
+def draw_lighthouse():
+    """Tapered tower (gluCylinder with different base/top radius) + beacon sphere."""
+    x, y, z = LIGHTHOUSE_POS
+    glPushMatrix()
+    glTranslatef(x, y, z)
+
+    glColor3f(0.85, 0.85, 0.8)
+    glPushMatrix()
+    gluCylinder(gluNewQuadric(), 40, 25, 220, 12, 12)
+    glPopMatrix()
+
+    glColor3f(1.0, 0.9, 0.2)  # beacon housing
+    glPushMatrix()
+    glTranslatef(0, 0, 220)
+    gluSphere(gluNewQuadric(), 22, 10, 10)
+
+    # Light beam — a thin cuboid offset from center so rotation is
+    # actually visible (a plain sphere spinning looks static).
+    glRotatef(beacon_rotation, 0, 0, 1)
+    glColor3f(1.0, 1.0, 0.7)
+    glPushMatrix()
+    glTranslatef(35, 0, 0)
+    glScalef(50, 4, 4)
+    glutSolidCube(1)
+    glPopMatrix()
+    glPopMatrix()
+
+    glPopMatrix()
+
+
+def draw_gate():
+    """
+    Thin wall blocking the lighthouse entrance. `gate_anim` (0..1) slides
+    the gate from left to right as it opens — driven by update_barriers()
+    in the idle loop, not an instant toggle.
+    """
+    x, y, z = GATE_POS
+
+    # Slide the gate along +X: left (closed) -> right (open).
+    gate_slide_distance = 120.0
+    gate_y = y - gate_slide_distance * gate_anim
+
+    glPushMatrix()
+    glTranslatef(x, gate_y, z)
+    glColor3f(0.4, 0.25, 0.15)
+    glPushMatrix()
+    glScalef(8, 70, 60)
+    glTranslatef(0, 0, 0.5)
+    glutSolidCube(1)
+    glPopMatrix()
+    glPopMatrix()
+
+
+def draw_bridge():
+    """
+    Platform spanning the gap between islands. `bridge_anim` (0..1) is
+    driven by update_barriers() in the idle loop — 0 keeps it submerged
+    and unusable, 1 means fully risen and walkable.
+    """
+    x, y, z = BRIDGE_CENTER
+    glPushMatrix()
+    glTranslatef(x, y, -60.0 + 60.0 * bridge_anim)
+    glColor3f(0.45, 0.35, 0.2)
+    glPushMatrix()
+    glScalef(130, 60, 8)
+    glTranslatef(0, 0, 0.5)
+    glutSolidCube(1)
+    glPopMatrix()
+    glPopMatrix()
+
+
+def draw_fuel_canisters():
+    """Cylinders for each uncollected fuel canister."""
+    glColor3f(0.9, 0.5, 0.1)
+    for canister in fuel_canisters:
+        if canister["collected"]:
+            continue
+        x, y = canister["pos"]
+        glPushMatrix()
+        glTranslatef(x, y, 0)
+        gluCylinder(gluNewQuadric(), 10, 10, 28, 10, 10)
+        glPopMatrix()
+
+
+def get_debris_position(d):
+    """
+    Current (x, y) for a debris piece, purely a function of elapsed_time —
+    no per-frame state mutation needed, and it naturally freezes when
+    the game is paused since elapsed_time itself stops advancing.
+    """
+    offset = d["amplitude"] * math.sin(elapsed_time * d["speed"])
+    if d["axis"] == "y":
+        return d["base_x"], d["base_y"] + offset
+    return d["base_x"] + offset, d["base_y"]
+
+
+def draw_debris():
+    """Floating logs — cylinders rotated to lie flat, drifting back and forth."""
+    glColor3f(0.35, 0.22, 0.12)
+    for d in DEBRIS:
+        x, y = get_debris_position(d)
+        glPushMatrix()
+        glTranslatef(x, y, 6)
+        glRotatef(90, 0, 1, 0)
+        gluCylinder(gluNewQuadric(), d["radius"] * 0.6, d["radius"] * 0.6, 45, 10, 10)
+        glPopMatrix()
+
+
+def draw_plants():
+    """
+    Purely decorative cone-shaped mountains/trees using gluCylinder
+    with topRadius=0. Not collidable — same 'duplicate static object'
+    category as the rocks visually, added for charm, not for feature count.
+    """
+    glColor3f(0.15, 0.5, 0.2)
+    for x, y, r, h in PLANT_POSITIONS:
+        glPushMatrix()
+        glTranslatef(x, y, 0)
+        gluCylinder(gluNewQuadric(), r, 0, h, 10, 10)
+        glPopMatrix()
+
+
+def draw_world():
+    """Single entry point that draws every static + semi-static object."""
+    draw_water()
+    draw_island_terrain()
+    draw_flood_zones()
+    draw_boundary_walls()
+    draw_dock()
+    draw_generator()
+    draw_rocks()
+    draw_plants()
+    draw_lighthouse()
+    draw_gate()
+    draw_bridge()
+    draw_fuel_canisters()
+    draw_debris()
+    draw_goat()
+
+
+# ============================================================
+# PHASE 2 — PLAYER: MODEL, MOVEMENT, COLLISION
+# Base movement (W/S/A/D) mirrors Assignment 3's control scheme,
+# so it's necessary scaffolding but NOT counted as a scored
+# feature on its own. Collision against static world geometry
+# below IS new relative to A3 and counts as a feature.
+# ============================================================
+
+def draw_player():
+    """Sphere head + cuboid body, with a small nose cuboid indicating facing direction."""
+    glPushMatrix()
+    glTranslatef(player_pos[0], player_pos[1], player_pos[2])
+    glRotatef(player_angle, 0, 0, 1)
+
+    glColor3f(0.2, 0.3, 0.6)  # torso
+    glPushMatrix()
+    glTranslatef(0, 0, 20)
+    glScalef(20, 20, 40)
+    glutSolidCube(1)
+    glPopMatrix()
+
+    glColor3f(0.9, 0.75, 0.6)  # head
+    glPushMatrix()
+    glTranslatef(0, 0, 48)
+    gluSphere(gluNewQuadric(), 14, 10, 10)
+    glPopMatrix()
+
+    glColor3f(0.9, 0.2, 0.2)  # facing indicator
+    glPushMatrix()
+    glTranslatef(20, 0, 48)
+    glScalef(12, 5, 5)
+    glutSolidCube(1)
+    glPopMatrix()
+
+    glPopMatrix()
+
+
+def _point_in_bounds(x, y, bounds, margin=20):
+    x0, x1, y0, y1 = bounds
+    return (x0 + margin) <= x <= (x1 - margin) and (y0 + margin) <= y <= (y1 - margin)
+
+
+def _point_on_bridge(x, y):
+    # x-edge (82) intentionally overlaps the island's own walkable edge
+    # (±80, from ISLAND_*_BOUNDS margin) so there's no seam gap at the
+    # island->bridge transition. y-edge (35) stays close to the visible
+    # 130x60 plank (±65/±30) with just a small forgiving margin.
+    bx, by, _ = BRIDGE_CENTER
+    return (bx - 82) <= x <= (bx + 82) and (by - 35) <= y <= (by + 35)
+
+
+def _distance(x1, y1, x2, y2):
+    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+
+
+def is_position_walkable(x, y):
+    """
+    Collision check against the static world. This is the piece that's
+    genuinely new relative to Assignment 3 (which only checks bullet/enemy
+    vs. player proximity, never player vs. static geometry).
+    """
+    # The bridge corridor overlaps both island collision margins. This is
+    # important because the islands use a 20-unit safety margin, while the
+    # bridge itself must provide a continuous path between them.
+    on_solid_ground = (
+        _point_in_bounds(x, y, ISLAND_A_BOUNDS)
+        or _point_in_bounds(x, y, ISLAND_B_BOUNDS)
+        or (bridge_anim >= 0.9 and _point_on_bridge(x, y))
+    )
+    if not on_solid_ground:
+        return False  # would step into open water/gap
+
+    # Rocks block movement
+    for rx, ry, scale in ROCK_POSITIONS:
+        if _distance(x, y, rx, ry) < (scale * 0.7 + 14):
+            return False
+
+    # Generator housing blocks movement
+    gx, gy, _ = GENERATOR_POS
+    if _distance(x, y, gx, gy) < 42:
+        return False
+
+    # Gate blocks movement until mostly open
+    if gate_anim < 0.9:
+        gxp, gyp, _ = GATE_POS
+        if abs(x - gxp) < 14 and abs(y - gyp) < 38:
+            return False
+
+    # Drifting debris blocks movement wherever it currently sits
+    for d in DEBRIS:
+        dx, dy = get_debris_position(d)
+        if _distance(x, y, dx, dy) < (d["radius"] + 14):
+            return False
+
+    return True
+
+
+def try_move_player(dx, dy):
+    """Attempts a move; rejects it entirely if the destination isn't walkable."""
+    new_x = player_pos[0] + dx
+    new_y = player_pos[1] + dy
+    if is_position_walkable(new_x, new_y):
+        player_pos[0] = new_x
+        player_pos[1] = new_y
+
+
+# ============================================================
+# PHASE 4 — FUEL COLLECTION, GENERATOR, BRIDGE/GATE UNLOCK CHAIN
+# ============================================================
+
+def set_interaction_message(text, duration=2.5):
+    global interaction_message, interaction_message_timer
+    interaction_message = text
+    interaction_message_timer = duration
+
+
+def update_fuel_pickups():
+    """Continuous overlap check — no key press needed, matching the proposal."""
+    global fuel_collected, score, score_multiplier, last_fuel_pickup_time
+    for canister in fuel_canisters:
+        if canister["collected"]:
+            continue
+        cx, cy = canister["pos"]
+        if _distance(player_pos[0], player_pos[1], cx, cy) < FUEL_PICKUP_RADIUS:
+            canister["collected"] = True
+            fuel_collected += 1
+
+            if last_fuel_pickup_time is not None and (elapsed_time - last_fuel_pickup_time) <= COMBO_WINDOW:
+                score_multiplier = min(MAX_MULTIPLIER, score_multiplier + 1)
+            else:
+                score_multiplier = 1
+            last_fuel_pickup_time = elapsed_time
+
+            score += 50 * score_multiplier
+            combo_note = f" x{score_multiplier} combo!" if score_multiplier > 1 else ""
+            set_interaction_message(f"Fuel collected! ({fuel_collected}/{fuel_required}){combo_note}")
+
+
+def try_interact():
+    """
+    Called on E key press. Generator activation and the victory
+    beacon both respond here, gated by their own conditions.
+    """
+    gx, gy, _ = GENERATOR_POS
+    if not generator_on and _distance(player_pos[0], player_pos[1], gx, gy) < INTERACT_RANGE:
+        if cheat_infinite_fuel or fuel_collected >= fuel_required:
+            activate_generator()
+        else:
+            set_interaction_message(
+                f"NOT ENOUGH FUEL. Required: {fuel_required}, Collected: {fuel_collected}"
+            )
+        return
+
+    lx, ly, _ = LIGHTHOUSE_POS
+    if gate_open and _distance(player_pos[0], player_pos[1], lx, ly) < BEACON_INTERACT_RANGE:
+        trigger_victory()
+
+
+def trigger_victory():
+    """
+    Only reachable once the gate is open (which itself required the
+    bridge risen, which required the generator, which required fuel) —
+    so there's no way to skip straight to the win condition.
+    """
+    global game_state, score
+    if game_state != "PLAYING":
+        return
+    game_state = "VICTORY"
+    score += 500
+    set_interaction_message(f"LIGHTHOUSE RESTORED! Final Score: {score}", duration=999)
+
+
+def get_current_objective():
+    """Whatever the player needs to do next, computed from existing state — no new flags."""
+    if not generator_on:
+        return "Generator", GENERATOR_POS
+    if bridge_anim < 0.99:
+        return "Bridge (still rising)", BRIDGE_CENTER
+    if not gate_open:
+        return "Lighthouse Gate", GATE_POS
+    return "Beacon", LIGHTHOUSE_POS
+
+
+def show_compass():
+    """
+    Directional readout to the current objective — computed on demand
+    from coordinates Claude already has, not a new HUD element that's
+    always on screen (unlike A3's static stat display).
+    """
+    name, pos = get_current_objective()
+    tx, ty, _ = pos
+    dx = tx - player_pos[0]
+    dy = ty - player_pos[1]
+    dist = math.sqrt(dx * dx + dy * dy)
+
+    target_angle = math.degrees(math.atan2(dy, dx))
+    rel = (target_angle - player_angle + 180) % 360 - 180  # normalize to -180..180
+
+    if -45 <= rel <= 45:
+        direction = "AHEAD"
+    elif 45 < rel <= 135:
+        direction = "LEFT"
+    elif -135 <= rel < -45:
+        direction = "RIGHT"
+    else:
+        direction = "BEHIND"
+
+    set_interaction_message(f"Next: {name} — {direction}, {int(dist)}m away", duration=3.0)
+
+
+def activate_generator():
+    """
+    Flips one shared state flag that both the bridge and (eventually)
+    the gate check — this single flag is what creates the
+    explore -> collect -> progress dependency chain.
+
+    Note: this intentionally does NOT rotate the player's facing angle.
+    Auto-turning the player would hijack camera control the instant E
+    is pressed, which feels like a glitch rather than a designed
+    moment. Use Q (compass) instead to get a bearing to the bridge.
+    """
+    global generator_on, bridge_open, score
+    generator_on = True
+    bridge_open = True
+    score += 200
+    set_interaction_message("GENERATOR ACTIVATED — bridge is rising! (Press Q for a bearing)", duration=3.5)
+
+
+def update_barriers(dt):
+    """
+    Advances bridge_anim/gate_anim toward their target (open) state
+    over time, and checks whether the gate's own unlock condition
+    (bridge risen + player near the gate) has been met.
+    """
+    global bridge_anim, gate_anim, gate_open
+
+    if bridge_open and bridge_anim < 1.0:
+        bridge_anim = min(1.0, bridge_anim + BARRIER_ANIM_SPEED * dt)
+
+    if not gate_open and bridge_anim >= 0.9:
+        gxp, gyp, _ = GATE_POS
+        if _distance(player_pos[0], player_pos[1], gxp, gyp) < GATE_TRIGGER_RANGE:
+            gate_open = True
+            set_interaction_message("The lighthouse gate slides open.")
+
+    if gate_open and gate_anim < 1.0:
+        gate_anim = min(1.0, gate_anim + BARRIER_ANIM_SPEED * dt)
+
+
+# ============================================================
+# PHASE 5 — RISING TIDE & FLOODING HAZARD (exposure meter)
+# Duration-based hazard: standing in an active flood zone drains
+# `player_exposure` continuously rather than an instant hit-based
+# life loss. A life is only lost once it's fully depleted,
+# at which point the player respawns at the dock and it refills.
+# This is the structural difference from Assignment 3's system,
+# which decrements a life on a single touch event.
+# ============================================================
+
+def is_player_in_flood_zone():
+    """True if the player currently stands in a coastal strip that's underwater."""
+    px, py = player_pos[0], player_pos[1]
+    for x0, x1, y0, y1, threshold in FLOOD_ZONES:
+        if water_level <= threshold:
+            continue
+        if x0 <= px <= x1 and y0 <= py <= y1:
+            return True
+    return False
+
+
+def respawn_at_dock():
+    """Sends the player back to the dock spawn point after exposure depletes."""
+    global player_angle
+    player_pos[0], player_pos[1], player_pos[2] = -340.0, 0.0, 0.0
+    player_angle = 90.0
+
+
+def handle_exposure_depleted():
+    """
+    Exposure hit zero: lose a life, refill the meter, respawn at the
+    dock. If no lives remain, the run ends — full Game Over handling
+    (state transitions, restart) is fleshed out in Phase 6.
+    """
+    global player_lives, player_exposure, game_state
+
+    player_lives -= 1
+    player_exposure = 100.0
+    respawn_at_dock()
+
+    if player_lives <= 0:
+        game_state = "GAME_OVER"
+        set_interaction_message("GAME OVER — the storm claimed the island.", duration=999)
+    else:
+        set_interaction_message(f"Swept back to the dock! Lives remaining: {player_lives}")
+
+
+def update_exposure(dt):
+    """Drains exposure while flooded, regenerates on dry ground."""
+    global player_exposure
+
+    if is_player_in_flood_zone():
+        player_exposure -= EXPOSURE_DRAIN_RATE * dt
+    else:
+        player_exposure += EXPOSURE_REGEN_RATE * dt
+
+    player_exposure = max(0.0, min(100.0, player_exposure))
+
+    if player_exposure <= 0.0:
+        handle_exposure_depleted()
+
+
+# ============================================================
+# PHASE 8 — POLISH: LIGHTNING FLASH, SCORE MULTIPLIER (above),
+# CHEAT MODES (F / T)
+# ============================================================
+
+def update_lightning(dt):
+    """
+    Schedules random lightning flashes. The gap between flashes shrinks
+    as time_remaining drops (urgency), so flashes get more frequent as
+    the storm intensifies — purely a function of elapsed_time, no
+    glutTimerFunc involved.
+    """
+    global next_lightning_time, lightning_flash_timer
+
+    if elapsed_time >= next_lightning_time:
+        lightning_flash_timer = LIGHTNING_FLASH_DURATION
+        urgency = time_remaining / TIME_LIMIT if TIME_LIMIT > 0 else 0.0
+        min_gap = 2.0
+        max_gap = 3.0 + 7.0 * urgency  # up to 10s early on, down to ~3s late game
+        next_lightning_time = elapsed_time + random.uniform(min_gap, max_gap)
+
+
+def draw_lightning_flash():
+    """
+    Full-screen flash using the same orthographic-overlay technique
+    draw_text() already uses (gluOrtho2D + GL_QUADS) — avoids
+    glClearColor/blending, neither of which is in the template.
+    """
+    if lightning_flash_timer <= 0.0:
+        return
+
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    gluOrtho2D(0, 1000, 0, 800)
+
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+
+    glColor3f(0.85, 0.9, 1.0)
+    glBegin(GL_QUADS)
+    glVertex3f(0, 0, 0)
+    glVertex3f(1000, 0, 0)
+    glVertex3f(1000, 800, 0)
+    glVertex3f(0, 800, 0)
+    glEnd()
+
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+
+
+def setupCamera():
+    """
+    Third-person camera that follows behind and above the player,
+    recalculated every frame from player_pos/player_angle via gluLookAt.
+    """
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    gluPerspective(fovY, 1.25, 0.1, 1500)
+    glMatrixMode(GL_MODELVIEW)
+    glLoadIdentity()
+
+    rad = math.radians(player_angle)
+    cam_x = player_pos[0] - camera_follow_distance * math.cos(rad)
+    cam_y = player_pos[1] - camera_follow_distance * math.sin(rad)
+    cam_z = player_pos[2] + camera_follow_height
+
+    gluLookAt(cam_x, cam_y, cam_z,
+              player_pos[0], player_pos[1], player_pos[2] + 30,
+              0, 0, 1)
+
+
+def keyboardListener(key, x, y):
+    """
+    W/S move forward/backward along the player's current facing angle.
+    A/D rotate the player. This scheme mirrors A3's controls (necessary
+    scaffolding, not a scored feature) — collision (is_position_walkable)
+    is the actual new piece layered on top.
+
+    R (restart) always works. P (pause/resume) works from PLAYING or
+    PAUSED. Movement/interact only apply while actively PLAYING.
+    """
+    global player_angle, game_state, is_zoomed, fovY
+    global cheat_infinite_fuel, cheat_tide_freeze
+
+    if key == b'r':
+        reset_game_state()
+        return
+
+    if key == b'p':
+        if game_state == "PLAYING":
+            game_state = "PAUSED"
+            set_interaction_message("PAUSED", duration=999)
+        elif game_state == "PAUSED":
+            game_state = "PLAYING"
+            set_interaction_message("Resumed.")
+        return
+
+    if game_state != "PLAYING":
+        return
+
+    rad = math.radians(player_angle)
+
+    if key == b'w':
+        try_move_player(player_speed * math.cos(rad), player_speed * math.sin(rad))
+    elif key == b's':
+        try_move_player(-player_speed * math.cos(rad), -player_speed * math.sin(rad))
+    elif key == b'a':
+        player_angle = (player_angle + 5) % 360
+    elif key == b'd':
+        player_angle = (player_angle - 5) % 360
+    elif key == b'e':
+        try_interact()
+    elif key == b'c':
+        is_zoomed = not is_zoomed
+        fovY = fovY_zoomed if is_zoomed else fovY_default
+    elif key == b'q':
+        show_compass()
+    elif key == b'f':
+        cheat_infinite_fuel = not cheat_infinite_fuel
+        set_interaction_message(f"[CHEAT] Infinite Fuel: {'ON' if cheat_infinite_fuel else 'OFF'}")
+    elif key == b't':
+        cheat_tide_freeze = not cheat_tide_freeze
+        set_interaction_message(f"[CHEAT] Tide Freeze: {'ON' if cheat_tide_freeze else 'OFF'}")
+
+
+def specialKeyListener(key, x, y):
+    """Arrow keys — reserved for future camera height/orbit adjustments if needed."""
+    pass
+
+
+def mouseListener(button, state, x, y):
+    """Reserved — not needed for current feature set, kept for template compliance."""
+    pass
+
+
+def idle():
+    """
+    Core loop driver. Computes delta time manually since glutTimerFunc
+    is not allowed. All time-based systems (tide, timer, drifting debris,
+    lightning) will read `elapsed_time` or the per-frame `dt` computed here.
+    """
+    global last_frame_time, elapsed_time, time_remaining, water_level
+    global interaction_message_timer, game_state, beacon_rotation
+    global lightning_flash_timer
+
+    now = time.time()
+    if last_frame_time is None:
+        last_frame_time = now
+    dt = now - last_frame_time
+    last_frame_time = now
+
+    if game_state == "PLAYING":
+        elapsed_time += dt
+
+        # Countdown timer ticks down
+        time_remaining = max(0.0, time_remaining - dt)
+        if time_remaining <= 0.0:
+            game_state = "GAME_OVER"
+            set_interaction_message("GAME OVER — the storm has arrived!", duration=999)
+
+        # Rising tide — flooding hazard logic lives in update_exposure()
+        if not cheat_tide_freeze:
+            water_level += water_rise_rate * dt
+
+        # Phase 4 systems
+        update_fuel_pickups()
+        update_barriers(dt)
+
+        update_goat(dt)
+
+        # Rain storm effect
+        update_rain(dt)
+
+        # Phase 5 system
+        update_exposure(dt)
+
+        # Phase 8 system
+        update_lightning(dt)
+
+        if lightning_flash_timer > 0.0:
+            lightning_flash_timer = max(0.0, lightning_flash_timer - dt)
+
+        if interaction_message_timer > 0.0:
+            interaction_message_timer = max(0.0, interaction_message_timer - dt)
+
+    elif game_state == "VICTORY":
+        # Beacon keeps spinning on the victory screen even though
+        # everything else (timer, tide, movement) is frozen.
+        beacon_rotation = (beacon_rotation + BEACON_ROTATION_SPEED * dt) % 360
+
+    glutPostRedisplay()
+
+
+def showScreen():
+    """
+    Display function. Now draws the full static world (Phase 1) in
+    addition to the Phase 0 scaffolding/placeholder HUD.
+    """
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    glLoadIdentity()
+    glViewport(0, 0, 1000, 800)
+
+    setupCamera()
+    draw_world()
+    draw_player()
+    draw_rain()
+    draw_lightning_flash()
+
+    # HUD
+    draw_text(10, 770, f"Lighthouse Keeper: Before the Storm | state: {game_state}")
+    draw_text(10, 740, f"Time Remaining: {int(time_remaining)}")
+    draw_text(10, 710, f"Water Level: {water_level:.1f}   Exposure: {int(player_exposure)}/100")
+    mult_note = f" (x{score_multiplier} combo)" if score_multiplier > 1 else ""
+    draw_text(10, 680, f"Lives: {player_lives}   Fuel: {fuel_collected}/{fuel_required}   Score: {score}{mult_note}")
+    draw_text(10, 650, f"Generator: {'ON' if generator_on else 'OFF'}   Gate: {'OPEN' if gate_open else 'CLOSED'}")
+
+    cheat_note = ""
+    if cheat_infinite_fuel or cheat_tide_freeze:
+        active = []
+        if cheat_infinite_fuel:
+            active.append("INF FUEL")
+        if cheat_tide_freeze:
+            active.append("TIDE FREEZE")
+        cheat_note = "   [CHEATS: " + ", ".join(active) + "]"
+    draw_text(10, 620, "Controls: W/S move, A/D turn, E interact, C zoom, Q compass, F/T cheats, P pause, R restart" + cheat_note)
+
+    if interaction_message_timer > 0.0:
+        draw_text(10, 590, interaction_message)
+
+    if game_state == "PAUSED":
+        draw_text(420, 420, "== PAUSED ==")
+        draw_text(370, 390, "Press P to resume, R to restart")
+    elif game_state == "GAME_OVER":
+        draw_text(400, 420, "== GAME OVER ==")
+        draw_text(360, 390, f"Final Score: {score}   Press R to restart")
+    elif game_state == "VICTORY":
+        draw_text(390, 420, "== LIGHTHOUSE RESTORED! ==")
+        draw_text(360, 390, f"Final Score: {score}   Press R to play again")
+
+    glutSwapBuffers()
+
+
+def main():
+    reset_game_state()
+
+    glutInit()
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH)
+    glutInitWindowSize(1000, 800)
+    glutInitWindowPosition(0, 0)
+    glutCreateWindow(b"Lighthouse Keeper: Before the Storm")
+
+    glutDisplayFunc(showScreen)
+    glutKeyboardFunc(keyboardListener)
+    glutSpecialFunc(specialKeyListener)
+    glutMouseFunc(mouseListener)
+    glutIdleFunc(idle)
+
+    glutMainLoop()
+
+
+if __name__ == "__main__":
+    main()
