@@ -5,10 +5,6 @@ import time
 import math
 import random
 
-# ============================================================
-# PHASE 0 — SCAFFOLDING
-# ============================================================
-
 camera_pos = (0, 500, 500)
 fovY = 120
 fovY_default = 120
@@ -79,7 +75,6 @@ next_lightning_time = 3.0
 lightning_flash_timer = 0.0
 LIGHTNING_FLASH_DURATION = 0.15
 
-# ---------- Rain storm effect ----------
 MAX_RAIN_DROPS = 300
 RAIN_MIN_SPEED = 180.0
 RAIN_MAX_SPEED = 350.0
@@ -112,13 +107,6 @@ def update_rain(dt):
             drop[2] = RAIN_TOP_HEIGHT
 
 def draw_rain():
-    """
-    Falling rain drawn as GL_POINTS — the same primitive type (and
-    glPointSize usage) the template itself demonstrates for its single
-    random point. GL_LINES is never used anywhere in the template, so
-    drawing streaks with it would be an unlisted-function risk; a point
-    per drop keeps this strictly inside the allowed primitive set.
-    """
     if TIME_LIMIT <= 0 or not rain_drops:
         return
     storm_progress = 1.0 - (time_remaining / TIME_LIMIT)
@@ -651,7 +639,7 @@ def draw_player():
     glPopMatrix()
 
 
-def _point_in_bounds(x, y, bounds, margin=20):
+def point_in_bounds(x, y, bounds, margin=20):
     x0, x1, y0, y1 = bounds
     return (x0 + margin) <= x <= (x1 - margin) and (y0 + margin) <= y <= (y1 - margin)
 
@@ -667,8 +655,8 @@ def _distance(x1, y1, x2, y2):
 
 def is_position_walkable(x, y):
     on_solid_ground = (
-        _point_in_bounds(x, y, ISLAND_A_BOUNDS)
-        or _point_in_bounds(x, y, ISLAND_B_BOUNDS)
+        point_in_bounds(x, y, ISLAND_A_BOUNDS)
+        or point_in_bounds(x, y, ISLAND_B_BOUNDS)
         or (bridge_anim >= 0.9 and _point_on_bridge(x, y))
     )
     if not on_solid_ground:
